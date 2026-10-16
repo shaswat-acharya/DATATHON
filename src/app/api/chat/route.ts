@@ -1,0 +1,212 @@
+import { NextRequest, NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { generateChatText } from "@/lib/gemini";
+import {
+  buildHistorySystemPrompt,
+  parseAssistantReply,
+} from "@/lib/medical-prompts";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isProviderBusy(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /"code"\s*:\s*503|\b503\b|UNAVAILABLE/i.test(message);
+}
+
+function isProviderQuotaExceeded(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /"code"\s*:\s*429|\b429\b|RESOURCE_EXHAUSTED|quota exceeded/i.test(message);
+}
+
+// POST /api/chat — one turn of the AI history-taking conversation.
+// Body: { patientId, encounterId?, message, language? }
+// `language` is the CURRENT UI language (may differ from patient.language if
+// the user switched mid-process). TTS is handled client-side via the browser's
+// Web Speech API.
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { patientId, encounterId, message, language } = body;
+    if (!patientId || !message) {
+      return NextResponse.json({ error: "patientId and message required" }, { status: 400 });
+    }
+    if (!process.env.GEMINI_API_KEY && !process.env.GROQ_API_KEY) {
+      return NextResponse.json(
+        { error: "AI chat is not configured. Set GROQ_API_KEY or GEMINI_API_KEY on the server." },
+        { status: 503 }
+      );
+    }
+
+    // Vercel functions cannot reliably use the project's local SQLite file.
+    // Prefer persistent records when available, but accept the current
+    // browser-session context for a privacy-preserving, non-persistent demo.
+    let patient = null as Awaited<ReturnType<typeof db.patient.findUnique>> | null;
+    let priorTurns: Array<{ role: string; content: string; section: string; language: string }> = [];
+    let canPersist = true;
+    try {
+      patient = await db.patient.findUnique({ where: { id: patientId } });
+      if (patient) {
+        priorTurns = await db.chatMessage.findMany({
+          where: { patientId, ...(encounterId ? { encounterId } : {}) },
+          orderBy: { createdAt: "asc" },
+        });
+      }
+    } catch {
+      canPersist = false;
+    }
+    if (!patient && body.patient) patient = body.patient;
+    if (!patient) return NextResponse.json({ error: "patient not found" }, { status: 404 });
+    if (!canPersist && Array.isArray(body.priorTurns)) priorTurns = body.priorTurns;
+
+    // Use the current language from the request (so mid-process language
+    // switches take effect immediately). Fall back to the patient's stored
+    // language if not provided.
+    const activeLang = language || patient.language || "en";
+
+    // If the user switched language, update the patient record so future
+    // requests (summary generation, etc.) also use the new language.
+    if (canPersist && language && language !== patient.language) {
+      await db.patient.update({ where: { id: patientId }, data: { language } });
+    }
+
+    // Build completed-sections list
+    const completedSections: string[] = Array.from(
+      new Set(priorTurns.filter((t) => t.section && t.section !== "general").map((t) => t.section))
+    );
+
+    const systemPrompt = buildHistorySystemPrompt({
+      language: activeLang,
+      ayushMode: patient.ayushMode,
+      patientName: patient.name,
+      patientAge: patient.age ?? undefined,
+      patientGender: patient.gender ?? undefined,
+      completedSections,
+    });
+
+    // Build messages: system + history + new user message.
+    // IMPORTANT: the system prompt uses the CURRENT language, so even if
+    // previous turns were in a different language, the AI will switch to
+    // the new language from this point on. We inject a short instruction
+    // right before the user's message to force the switch.
+    const langName = activeLang === "en" ? "English" :
+      activeLang === "hi" ? "Hindi (हिन्दी)" :
+      activeLang === "bn" ? "Bengali (বাংলা)" :
+      activeLang === "ta" ? "Tamil (தமிழ்)" :
+      activeLang === "te" ? "Telugu (తెలుగు)" :
+      activeLang === "mr" ? "Marathi (मराठी)" :
+      activeLang === "gu" ? "Gujarati (ગુજરાતી)" :
+      activeLang === "kn" ? "Kannada (ಕನ್ನಡ)" :
+      activeLang === "ml" ? "Malayalam (മലയാളം)" :
+      activeLang === "pa" ? "Punjabi (ਪੰਜਾਬੀ)" :
+      activeLang === "ur" ? "Urdu (اُردُو)" :
+      activeLang === "or" ? "Odia (ଓଡ଼ିଆ)" : "English";
+
+    const messages: Array<{ role: string; content: string }> = [
+      { role: "assistant", content: systemPrompt },
+      ...priorTurns.map((t) => ({ role: t.role, content: t.content })),
+      { role: "assistant", content: `[LANGUAGE SWITCH] From this point onward, you MUST respond ONLY in ${langName}. Ignore the language of any previous messages in this conversation. Reply in ${langName} now.` },
+      { role: "user", content: message },
+    ];
+
+    if (canPersist) {
+      await db.chatMessage.create({
+        data: { patientId, encounterId: encounterId ?? null, role: "user", content: message, section: body.section ?? "general", language: activeLang },
+      });
+    }
+
+    const prompt = messages
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n\n");
+
+    let rawReply: string | undefined;
+    let lastError: unknown;
+    // Gemini occasionally returns a temporary 503 during traffic spikes.
+    // Retry twice before surfacing a friendly, actionable error to the kiosk.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        rawReply = await generateChatText(prompt);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!isProviderBusy(error) || attempt === 2) throw error;
+        await sleep(500 * 2 ** attempt);
+      }
+    }
+    if (rawReply === undefined) throw lastError ?? new Error("The AI service did not return a response.");
+
+    if (!rawReply) {
+      throw new Error("The AI returned an empty response. Please try again.");
+    }
+
+    const parsed = parseAssistantReply(rawReply);
+
+    // Persist the assistant reply (clean text only, without internal tags)
+    const saved = canPersist
+      ? await db.chatMessage.create({
+          data: { patientId, encounterId: encounterId ?? null, role: "assistant", content: parsed.cleanText, section: parsed.section, language: activeLang },
+        })
+      : null;
+
+    // Persist any red flags
+    let savedRedFlags: Array<{ id: string; symptom: string; severity: string; reasoning: string | null; acknowledged: boolean; createdAt: string }> = [];
+    if (canPersist && parsed.redFlags.length > 0) {
+      const created = await Promise.all(
+        parsed.redFlags.map((rf) =>
+          db.redFlagAlert.create({
+            data: {
+              patientId,
+              encounterId: encounterId ?? null,
+              symptom: rf.symptom,
+              severity: rf.severity,
+              reasoning: rf.reasoning,
+            },
+          })
+        )
+      );
+      savedRedFlags = created.map((f) => ({
+        id: f.id,
+        symptom: f.symptom,
+        severity: f.severity,
+        reasoning: f.reasoning,
+        acknowledged: f.acknowledged,
+        createdAt: f.createdAt.toISOString(),
+      }));
+    } else if (parsed.redFlags.length > 0) {
+      savedRedFlags = parsed.redFlags.map((rf, index) => ({
+        id: `temporary-red-flag-${index}`,
+        symptom: rf.symptom,
+        severity: rf.severity,
+        reasoning: rf.reasoning,
+        acknowledged: false,
+        createdAt: new Date().toISOString(),
+      }));
+    }
+
+    // TTS is handled entirely client-side via the browser's Web Speech API
+    // (Google AI Studio-quality Indian-language voices). No server TTS.
+
+    return NextResponse.json({
+      reply: parsed.cleanText,
+      section: parsed.section,
+      language: activeLang,
+      done: parsed.done,
+      redFlags: savedRedFlags,
+      messageId: saved?.id ?? `temporary-message-${Date.now()}`,
+    });
+  } catch (err) {
+    console.error("POST /api/chat error:", err);
+    if (isProviderQuotaExceeded(err)) {
+      return NextResponse.json(
+        { error: "The AI chat quota has been reached for this Gemini project. Please wait for the quota to reset or enable billing for this API key's project." },
+        { status: 429 }
+      );
+    }
+    if (isProviderBusy(err)) {
+      return NextResponse.json(
+        { error: "The AI service is temporarily busy. Please try again in a moment." },
+        { status: 503 }
+      );
+    }
+    return NextResponse.json({ error: (err as Error).message }, { status: 500 });
+  }
+}
